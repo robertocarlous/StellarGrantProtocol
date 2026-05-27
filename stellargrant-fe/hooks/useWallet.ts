@@ -8,7 +8,6 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import * as freighterApi from "@stellar/freighter-api";
 import { useWalletStore } from "@/lib/store/walletStore";
 import { networkPassphraseConfig } from "@/lib/stellar/client";
 
@@ -35,12 +34,17 @@ export function useWallet(): WalletState {
 
     async function restoreSession() {
       try {
-        const connected = await freighterApi.isConnected();
+        const { isConnected, getAddress, getNetworkDetails } = await import("@stellar/freighter-api");
+        const connected = await isConnected();
         if (connected) {
-          const key = await freighterApi.getPublicKey();
-          const net = await freighterApi.getNetwork();
-          setAddress(key);
-          setNetwork(net as "testnet" | "mainnet" | "futurenet");
+          const addressResult = await getAddress();
+          if (addressResult.error) {
+            console.debug("Failed to get address:", addressResult.error);
+            return;
+          }
+          const networkResult = await getNetworkDetails();
+          setAddress(addressResult.address);
+          setNetwork(networkResult.network as "testnet" | "mainnet" | "futurenet");
           setWalletType("freighter");
         }
       } catch (err) {
@@ -61,10 +65,25 @@ export function useWallet(): WalletState {
           throw new Error("Freighter is only available in the browser");
         }
 
-        const key = await freighterApi.getPublicKey();
-        const net = await freighterApi.getNetwork();
-        setAddress(key);
-        setNetwork(net as "testnet" | "mainnet" | "futurenet");
+        const { getAddress, getNetworkDetails, isAllowed, setAllowed } = await import("@stellar/freighter-api");
+        
+        // Check and request permission
+        const access = await isAllowed();
+        if (!access.isAllowed) {
+          const permission = await setAllowed();
+          if (!permission.isAllowed) {
+            throw new Error("Freighter permission denied");
+          }
+        }
+
+        const addressResult = await getAddress();
+        if (addressResult.error) {
+          throw new Error(addressResult.error);
+        }
+        
+        const networkResult = await getNetworkDetails();
+        setAddress(addressResult.address);
+        setNetwork(networkResult.network as "testnet" | "mainnet" | "futurenet");
         setWalletType("freighter");
       } else {
         throw new Error(`${type} wallet is not supported yet`);
@@ -89,7 +108,8 @@ export function useWallet(): WalletState {
     }
 
     try {
-      const signedXdr = await freighterApi.signTransaction(xdr, {
+      const { signTransaction } = await import("@stellar/freighter-api");
+      const signedXdr = await signTransaction(xdr, {
         networkPassphrase: networkPassphraseConfig,
       });
       return signedXdr;
