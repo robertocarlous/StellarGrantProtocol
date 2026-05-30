@@ -53,6 +53,16 @@ pub enum ContractError {
     DisputeFeeInsufficient = 37,
     /// Dispute fee has already been charged for this milestone.
     DisputeAlreadyCharged = 38,
+    ExtensionDenied = 39,
+    DeadlineNotSet = 40,
+    ExpiryNotReached = 41,
+    RoleAlreadyAssigned = 42,
+    RoleNotAssigned = 43,
+    HeartbeatNotStale = 44,
+    DuplicateBountySubmitter = 45,
+    ContributorProfileRequired = 46,
+    BountySubmissionsCap = 47,
+    InvalidTokenInterface = 48,
 }
 
 #[contracttype]
@@ -138,7 +148,7 @@ impl EscrowState {
 }
 
 #[contracttype]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum MilestoneState {
     Pending = 0,
@@ -154,109 +164,115 @@ pub enum MilestoneState {
     AwaitingPayout = 8,
     /// An AwaitingPayout milestone was challenged by a funder.
     Challenged = 9,
+    /// Snapshot voting period where funders must vote on milestone approval.
+    FunderVoting = 10,
+    /// Milestone has expired due to deadline passing.
+    Expired = 11,
+    /// Milestone funds were claimed by funders after expiry.
+    ExpiredClaimed = 12,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Milestone {
+    pub idx: u32,
     pub description: String,
     pub amount: i128,
     pub payout_token: Address,
-    pub state: MilestoneState,
     pub votes: Map<Address, bool>,
     pub reasons: Map<Address, String>,
     pub status_updated_at: u64,
     pub proof_url: Option<String>,
     pub submission_timestamp: u64,
-    pub deadline: u64,
+    pub deadline_timestamp: u64,
     pub community_comments: Map<Address, String>,
-    pub pending_extension_deadline: Option<u64>,
-    pub extension_votes: Map<Address, bool>,
-    /// Packed fields (u32 each): idx, approvals, rejections, community_upvotes
+    pub additional_funds: Map<Address, i128>,
+    pub top_up_contributions: Vec<MilestoneTopUp>,
+    pub bounty_winner: Option<Address>,
+    pub proof_hash: Option<soroban_sdk::BytesN<32>>,
     pub packed_stats: u128,
 }
 
 impl Milestone {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        idx: u32,
         description: String,
         amount: i128,
         payout_token: Address,
-        state: MilestoneState,
-        votes: Map<Address, bool>,
-        reasons: Map<Address, String>,
-        status_updated_at: u64,
-        proof_url: Option<String>,
-        submission_timestamp: u64,
-        deadline: u64,
-        community_comments: Map<Address, String>,
-        idx: u32,
-        approvals: u32,
-        rejections: u32,
-        community_upvotes: u32,
-        pending_extension_deadline: Option<u64>,
-        extension_votes: Map<Address, bool>,
+        deadline_timestamp: u64,
+        env: &soroban_sdk::Env,
     ) -> Self {
-        let mut ms = Self {
+        let mut m = Self {
+            idx,
             description,
             amount,
             payout_token,
-            state,
-            votes,
-            reasons,
-            status_updated_at,
-            proof_url,
-            submission_timestamp,
-            deadline,
-            community_comments,
-            pending_extension_deadline,
-            extension_votes,
+            votes: Map::new(env),
+            reasons: Map::new(env),
+            status_updated_at: 0,
+            proof_url: None,
+            submission_timestamp: 0,
+            deadline_timestamp,
+            community_comments: Map::new(env),
+            additional_funds: Map::new(env),
+            top_up_contributions: Vec::new(env),
+            bounty_winner: None,
+            proof_hash: None,
             packed_stats: 0,
         };
-        ms.set_idx(idx);
-        ms.set_approvals(approvals);
-        ms.set_rejections(rejections);
-        ms.set_community_upvotes(community_upvotes);
-        ms
-    }
-
-    pub fn idx(&self) -> u32 {
-        (self.packed_stats & 0xFFFFFFFF) as u32
-    }
-    pub fn set_idx(&mut self, val: u32) {
-        self.packed_stats = (self.packed_stats & !0xFFFFFFFF) | (val as u128);
+        m.set_state(MilestoneState::Pending);
+        m.set_approvals(0);
+        m.set_rejections(0);
+        m.set_community_upvotes(0);
+        m
     }
 
     pub fn state(&self) -> MilestoneState {
-        self.state
+        match (self.packed_stats & 0xFFFFFFFF) as u32 {
+            0 => MilestoneState::Pending,
+            1 => MilestoneState::Submitted,
+            2 => MilestoneState::Approved,
+            3 => MilestoneState::Paid,
+            4 => MilestoneState::Rejected,
+            5 => MilestoneState::Disputed,
+            6 => MilestoneState::Resolved,
+            7 => MilestoneState::CommunityReview,
+            8 => MilestoneState::AwaitingPayout,
+            9 => MilestoneState::Challenged,
+            10 => MilestoneState::FunderVoting,
+            11 => MilestoneState::Expired,
+            12 => MilestoneState::ExpiredClaimed,
+            _ => MilestoneState::Pending,
+        }
     }
 
     pub fn set_state(&mut self, state: MilestoneState) {
-        self.state = state;
+        self.packed_stats = (self.packed_stats & !0xFFFFFFFF) | (state as u32 as u128);
     }
 
     pub fn approvals(&self) -> u32 {
         ((self.packed_stats >> 32) & 0xFFFFFFFF) as u32
     }
 
-    pub fn set_approvals(&mut self, val: u32) {
-        self.packed_stats = (self.packed_stats & !(0xFFFFFFFF << 32)) | ((val as u128) << 32);
+    pub fn set_approvals(&mut self, approvals: u32) {
+        self.packed_stats = (self.packed_stats & !(0xFFFFFFFF << 32)) | ((approvals as u128) << 32);
     }
 
     pub fn rejections(&self) -> u32 {
         ((self.packed_stats >> 64) & 0xFFFFFFFF) as u32
     }
 
-    pub fn set_rejections(&mut self, val: u32) {
-        self.packed_stats = (self.packed_stats & !(0xFFFFFFFF << 64)) | ((val as u128) << 64);
+    pub fn set_rejections(&mut self, rejections: u32) {
+        self.packed_stats =
+            (self.packed_stats & !(0xFFFFFFFF << 64)) | ((rejections as u128) << 64);
     }
 
     pub fn community_upvotes(&self) -> u32 {
         ((self.packed_stats >> 96) & 0xFFFFFFFF) as u32
     }
 
-    pub fn set_community_upvotes(&mut self, val: u32) {
-        self.packed_stats = (self.packed_stats & !(0xFFFFFFFF << 96)) | ((val as u128) << 96);
+    pub fn set_community_upvotes(&mut self, upvotes: u32) {
+        self.packed_stats = (self.packed_stats & !(0xFFFFFFFF << 96)) | ((upvotes as u128) << 96);
     }
 }
 
@@ -266,7 +282,7 @@ pub struct MilestoneSubmission {
     pub idx: u32,
     pub description: String,
     pub proof: String,
-    pub payout_token: Option<Address>,
+    pub payout_token: Option<Address>, // New: Optional override for the payout token
 }
 
 #[contracttype]
@@ -276,10 +292,16 @@ pub enum GrantStatus {
     Active = 1,
     Cancelled = 2,
     Completed = 3,
+    /// Cancellation requested but grace period has not elapsed yet.
     CancellationPending = 4,
+    /// Grant is temporarily paused; no funding, submissions, or payouts allowed.
     Paused = 5,
+    /// Grant became inactive due to missed heartbeats; can be restored via grant_ping.
     Inactive = 6,
+    /// Grant is waiting to reach its minimum funding threshold before becoming Active.
     PendingFunding = 7,
+    /// Grant has been created but not yet accepted by the recipient (owner).
+    /// No funding is allowed until the grant transitions out of this state.
     PendingAcceptance = 8,
 }
 
@@ -288,7 +310,7 @@ pub enum GrantStatus {
 pub struct GrantFund {
     pub funder: Address,
     pub amount: i128,
-    pub token: Address,
+    pub token: Address, // New: Specify which token was contributed
 }
 
 #[contracttype]
@@ -311,8 +333,9 @@ pub struct Grant {
     pub min_funding: i128,
     pub hard_cap: i128,
     pub tags: Vec<String>,
-    /// Packed fields (u32 each): status, quorum, total_milestones, milestones_paid_out
-    pub packed_config: u128,
+    pub is_open_bounty: bool,
+    pub is_public_good: bool,
+    pub packed_stats: u128,
 }
 
 impl Grant {
@@ -329,16 +352,12 @@ impl Grant {
         status: GrantStatus,
         quorum: u32,
         total_milestones: u32,
-        milestones_paid_out: u32,
-        escrow_balances: Map<Address, i128>,
-        funders: Vec<GrantFund>,
-        reason: Option<String>,
         timestamp: u64,
-        last_heartbeat: u64,
         min_funding: i128,
         hard_cap: i128,
         tags: Vec<String>,
-        cancellation_requested_at: Option<u64>,
+        is_public_good: bool,
+        env: &soroban_sdk::Env,
     ) -> Self {
         let mut g = Self {
             id,
@@ -349,26 +368,28 @@ impl Grant {
             total_amount,
             milestone_amount,
             reviewers,
-            escrow_balances,
-            funders,
-            reason,
+            escrow_balances: Map::new(env),
+            funders: Vec::new(env),
+            reason: None,
             timestamp,
-            cancellation_requested_at,
-            last_heartbeat,
+            cancellation_requested_at: None,
+            last_heartbeat: timestamp,
             min_funding,
             hard_cap,
             tags,
-            packed_config: 0,
+            is_open_bounty: false,
+            is_public_good,
+            packed_stats: 0,
         };
         g.set_status(status);
         g.set_quorum(quorum);
         g.set_total_milestones(total_milestones);
-        g.set_milestones_paid_out(milestones_paid_out);
+        g.set_milestones_paid_out(0);
         g
     }
 
     pub fn status(&self) -> GrantStatus {
-        match (self.packed_config & 0xFFFFFFFF) as u32 {
+        match (self.packed_stats & 0xFFFFFFFF) as u32 {
             1 => GrantStatus::Active,
             2 => GrantStatus::Cancelled,
             3 => GrantStatus::Completed,
@@ -382,31 +403,31 @@ impl Grant {
     }
 
     pub fn set_status(&mut self, status: GrantStatus) {
-        self.packed_config = (self.packed_config & !0xFFFFFFFF) | (status as u32 as u128);
+        self.packed_stats = (self.packed_stats & !0xFFFFFFFF) | (status as u32 as u128);
     }
 
     pub fn quorum(&self) -> u32 {
-        ((self.packed_config >> 32) & 0xFFFFFFFF) as u32
+        ((self.packed_stats >> 32) & 0xFFFFFFFF) as u32
     }
 
     pub fn set_quorum(&mut self, quorum: u32) {
-        self.packed_config = (self.packed_config & !(0xFFFFFFFF << 32)) | ((quorum as u128) << 32);
+        self.packed_stats = (self.packed_stats & !(0xFFFFFFFF << 32)) | ((quorum as u128) << 32);
     }
 
     pub fn total_milestones(&self) -> u32 {
-        ((self.packed_config >> 64) & 0xFFFFFFFF) as u32
+        ((self.packed_stats >> 64) & 0xFFFFFFFF) as u32
     }
 
     pub fn set_total_milestones(&mut self, total: u32) {
-        self.packed_config = (self.packed_config & !(0xFFFFFFFF << 64)) | ((total as u128) << 64);
+        self.packed_stats = (self.packed_stats & !(0xFFFFFFFF << 64)) | ((total as u128) << 64);
     }
 
     pub fn milestones_paid_out(&self) -> u32 {
-        ((self.packed_config >> 96) & 0xFFFFFFFF) as u32
+        ((self.packed_stats >> 96) & 0xFFFFFFFF) as u32
     }
 
     pub fn set_milestones_paid_out(&mut self, paid: u32) {
-        self.packed_config = (self.packed_config & !(0xFFFFFFFF << 96)) | ((paid as u128) << 96);
+        self.packed_stats = (self.packed_stats & !(0xFFFFFFFF << 96)) | ((paid as u128) << 96);
     }
 }
 
@@ -432,4 +453,77 @@ pub struct DisputeInfo {
     pub payer: Address,
     pub fee_amount: i128,
     pub fee_token: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BountySubmissionEntry {
+    pub submitter: Address,
+    pub description: String,
+    pub proof_url: String,
+    pub payout_token: Address,
+    pub submission_timestamp: u64,
+    pub votes: Map<Address, bool>,
+    pub reasons: Map<Address, String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionRequest {
+    pub requester: Address,
+    pub new_deadline: u64,
+    pub approvals: Map<Address, bool>,
+    pub approvals_count: u32,
+}
+
+impl ExtensionRequest {
+    pub fn new(env: &soroban_sdk::Env, requester: Address, new_deadline: u64) -> Self {
+        Self {
+            requester,
+            new_deadline,
+            approvals: Map::new(env),
+            approvals_count: 0,
+        }
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Role {
+    Admin = 0,
+    Reviewer = 1,
+    Contributor = 2,
+    GrantCreator = 3,
+    Pauser = 4,
+}
+
+/// Packed bitfield storing which roles an address has been granted.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AccessControl {
+    pub role_flags: u32,
+}
+
+impl AccessControl {
+    pub fn has_role(&self, role: Role) -> bool {
+        (self.role_flags >> (role as u32)) & 1 == 1
+    }
+
+    pub fn grant(&mut self, role: Role) {
+        self.role_flags |= 1 << (role as u32);
+    }
+
+    pub fn revoke(&mut self, role: Role) {
+        self.role_flags &= !(1 << (role as u32));
+    }
+}
+
+/// Records a single funder top-up contribution to a specific milestone.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MilestoneTopUp {
+    pub funder: Address,
+    pub token: Address,
+    pub amount: i128,
 }

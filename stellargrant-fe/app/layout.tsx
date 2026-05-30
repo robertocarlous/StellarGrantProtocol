@@ -1,10 +1,9 @@
 import type { Metadata } from "next";
 import { Orbitron, IBM_Plex_Mono } from "next/font/google";
 import "./globals.css";
-import { validateEnvOnStartup } from "../lib/config/env-validation";
-
-// Validate environment variables at startup
-validateEnvOnStartup();
+import { Providers } from "./providers";
+import { AppHeader } from "@/components/layout/AppHeader";
+import { AppFooter } from "@/components/layout/AppFooter";
 
 const orbitron = Orbitron({
   variable: "--font-orbitron",
@@ -19,8 +18,15 @@ const ibmPlexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "StellarGrant Protocol",
+  title: {
+    default: "StellarGrant Protocol",
+    template: "%s | StellarGrant",
+  },
   description: "Decentralized milestone-based grant management on Stellar",
+  openGraph: {
+    siteName: "StellarGrant Protocol",
+    type: "website",
+  },
   other: {
     "theme-color": "#050A14",
   },
@@ -36,7 +42,13 @@ export default function RootLayout({
       <body
         className={`${orbitron.variable} ${ibmPlexMono.variable} antialiased`}
       >
-        {children}
+        <Providers>
+          <AppHeader />
+          <main className="min-h-[calc(100vh-64px)] relative z-10">
+            {children}
+          </main>
+          <AppFooter />
+        </Providers>
       </body>
     </html>
   );
