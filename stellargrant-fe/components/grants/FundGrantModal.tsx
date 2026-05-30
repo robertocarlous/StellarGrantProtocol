@@ -42,10 +42,12 @@ export function FundGrantModal({ grant, open, onClose, onSuccess }: FundGrantMod
 
   useEffect(() => {
     if (!open) {
-      setAmountInput("");
-      setValidationError(null);
-      setSuccessTx(null);
-      resetFund();
+      queueMicrotask(() => {
+        setAmountInput("");
+        setValidationError(null);
+        setSuccessTx(null);
+        resetFund();
+      });
     }
   }, [open, resetFund]);
 

@@ -22,7 +22,7 @@ export function useRelativeTime(date: Date | string | number): string {
   useEffect(() => {
     const target = new Date(date);
     const tick = () => setLabel(formatRelative(target));
-    tick();
+    queueMicrotask(tick);
     const id = setInterval(tick, 60_000);
     return () => clearInterval(id);
   }, [date]);
