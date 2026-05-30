@@ -27,6 +27,7 @@ vi.mock("@/hooks/useGrant", () => ({
       grant: {
         id: GRANT_ID,
         owner: WALLET_ADDRESS,
+        recipient: WALLET_ADDRESS,
         reviewers: [],
         title: "Test Grant",
         budget: 1_000_000n,
