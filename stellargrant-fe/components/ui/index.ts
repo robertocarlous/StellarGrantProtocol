@@ -40,3 +40,6 @@ export type { ConfirmationDialogProps } from "./ConfirmationDialog";
 
 export { DatePicker, computeRelativeDateLabel, todayIso } from "./DatePicker";
 export type { DatePickerProps, RelativeDateLabel, RelativeDateTone } from "./DatePicker";
+
+export { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
+export type { KeyboardShortcutsOverlayProps } from "./KeyboardShortcutsOverlay";

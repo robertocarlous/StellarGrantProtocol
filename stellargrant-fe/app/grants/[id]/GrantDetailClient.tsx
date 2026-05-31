@@ -2,6 +2,7 @@
 
 import { use, Suspense, useEffect, useMemo, useState, useCallback, useRef } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ExternalLink, Download, ChevronDown } from "lucide-react";
 import { FundingProgress } from "@/components/grants/FundingProgress";
 import { GrantStatusBadge } from "@/components/grants/GrantStatusBadge";
@@ -23,6 +24,7 @@ import { useGrantBalances } from "@/hooks/useGrantBalances";
 import { useRelativeTime } from "@/hooks/useRelativeTime";
 import { useContractEvents } from "@/hooks/useContractEvents";
 import { useOptimisticGrant } from "@/hooks/useOptimisticGrant";
+import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { toast } from "@/lib/toast";
 import { ErrorCard } from "@/components/ui/ErrorCard";
 import type { TokenMetadata, Grant, Milestone } from "@/types";
@@ -148,6 +150,7 @@ function GrantDetailSkeleton() {
 
 
 function GrantDetailContent({ grantId }: { grantId: string }) {
+  const router = useRouter();
   const { data, isLoading, error, errorType, refetch } = useGrant(grantId);
   const { 
     events, 
@@ -162,6 +165,29 @@ function GrantDetailContent({ grantId }: { grantId: string }) {
   const { funders, isLoading: fundersLoading, refetch: refetchFunders } = useFunders(grantId);
   const [fundModalOpen, setFundModalOpen] = useState(false);
   const [tokenMetadata, setTokenMetadata] = useState<TokenMetadata | null>(null);
+
+  useKeyboardShortcuts([
+    {
+      key: "F",
+      description: "Fund Grant",
+      action: (e) => {
+        e?.preventDefault();
+        if (!optimisticGrant) return;
+        const statusLabel = ["Pending", "Active", "In Progress", "Completed", "Cancelled"][optimisticGrant.status] ?? "Pending";
+        if (statusLabel !== "Completed" && statusLabel !== "Cancelled") {
+          setFundModalOpen(true);
+        }
+      },
+    },
+    {
+      key: "h",
+      description: "Grant History",
+      action: (e) => {
+        e?.preventDefault();
+        router.push(`/grants/${grantId}/history`);
+      },
+    },
+  ]);
 
   // Handle incoming GrantFunded events
   useEffect(() => {

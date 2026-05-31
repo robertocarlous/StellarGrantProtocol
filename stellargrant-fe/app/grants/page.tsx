@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { GrantCard } from "@/components/grants/GrantCard";
 import { apiGet } from "@/lib/api";
-import { EmptyState, ErrorCard, PageHeader } from "@/components/ui";
+import { EmptyState, ErrorCard, PageHeader, SearchInput } from "@/components/ui";
+import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 
 /** Raw shape returned by the API */
 type GrantListItem = {
@@ -52,11 +54,59 @@ function normaliseGrant(raw: GrantListItem): GrantCardInput {
 }
 
 export default function GrantsPage() {
+  const router = useRouter();
   const [grants, setGrants] = useState<GrantCardInput[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [errorType, setErrorType] = useState<"network" | "api" | "rpc" | "generic">("generic");
   const [retryCount, setRetryCount] = useState(0);
+
+  const [filterQuery, setFilterQuery] = useState("");
+  const [focusedGrantIndex, setFocusedGrantIndex] = useState(-1);
+
+  const filteredGrants = grants.filter(
+    (g) => g.title.toLowerCase().includes(filterQuery.toLowerCase())
+  );
+
+  useKeyboardShortcuts([
+    {
+      key: "f",
+      description: "Focus Filters",
+      action: (e) => {
+        e?.preventDefault();
+        const searchInput = document.querySelector('input[type="search"]') as HTMLInputElement | null;
+        searchInput?.focus();
+      },
+    },
+    {
+      key: "j",
+      description: "Next Grant",
+      condition: () => filteredGrants.length > 0,
+      action: (e) => {
+        e?.preventDefault();
+        setFocusedGrantIndex((prev) => Math.min(prev + 1, filteredGrants.length - 1));
+      },
+    },
+    {
+      key: "k",
+      description: "Previous Grant",
+      condition: () => filteredGrants.length > 0,
+      action: (e) => {
+        e?.preventDefault();
+        setFocusedGrantIndex((prev) => Math.max(prev - 1, 0));
+      },
+    },
+    {
+      key: "Enter",
+      description: "Open Grant",
+      condition: () => focusedGrantIndex >= 0 && focusedGrantIndex < filteredGrants.length,
+      action: (e) => {
+        e?.preventDefault();
+        const grantId = filteredGrants[focusedGrantIndex].id;
+        router.push(`/grants/${grantId}`);
+      },
+    },
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -97,6 +147,17 @@ export default function GrantsPage() {
         description="Track open grants, see which milestone tracks are slipping, and jump straight into the creator work queue."
       />
 
+      <div className="mb-6 max-w-md">
+        <SearchInput
+          value={filterQuery}
+          onChange={(v) => {
+            setFilterQuery(v);
+            setFocusedGrantIndex(-1); // reset focus on search
+          }}
+          placeholder="Filter grants by title…"
+        />
+      </div>
+
       {loading && (
         <div className="grid gap-4 md:grid-cols-2">
           {Array.from({ length: 4 }).map((_, index) => (
@@ -113,18 +174,27 @@ export default function GrantsPage() {
         />
       )}
 
-      {!loading && !error && grants.length === 0 && (
+      {!loading && !error && filteredGrants.length === 0 && grants.length > 0 && (
         <EmptyState
-          title="No grants yet"
-          description="Be the first to create a grant and kick off a milestone track."
-          action={{ label: "Create a grant", href: "/grants/create" }}
+          title="No matches found"
+          description={`No grants match "${filterQuery}".`}
+          action={{ label: "Clear filter", action: () => setFilterQuery("") }}
         />
       )}
 
-      {!loading && !error && grants.length > 0 && (
+      {!loading && !error && filteredGrants.length > 0 && (
         <div className="grid gap-4 md:grid-cols-2">
-          {grants.map((grant) => (
-            <GrantCard key={grant.id} grant={grant} />
+          {filteredGrants.map((grant, index) => (
+            <div
+              key={grant.id}
+              className={`transition-all duration-200 ${
+                focusedGrantIndex === index
+                  ? "ring-2 ring-accent-primary ring-offset-2 ring-offset-bg-primary shadow-lg scale-[1.02]"
+                  : ""
+              }`}
+            >
+              <GrantCard grant={grant} />
+            </div>
           ))}
         </div>
       )}
