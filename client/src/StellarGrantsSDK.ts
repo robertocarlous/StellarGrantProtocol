@@ -8,16 +8,44 @@ import {
 } from "@stellar/stellar-sdk";
 import { parseSorobanError } from "./errors/parseSorobanError";
 import { StellarGrantsError } from "./errors/StellarGrantsError";
+import { TransactionTimeoutError } from "./errors/TransactionTimeoutError";
+import { TransactionFailedError } from "./errors/TransactionFailedError";
 import {
   GrantCreateInput,
   GrantFundInput,
   MilestoneSubmitInput,
   MilestoneVoteInput,
   StellarGrantsSDKConfig,
+  TransactionResult,
+  WaitForTransactionOptions,
+  TransactionPollingStatus,
+  IpfsUploadConfig,
 } from "./types";
 import { meetsThreshold, PendingXdrStore } from "./utils/transactions";
+import { combineSignatures } from "./utils/transactions";
+import { uploadMetadataToIPFS, fetchMetadataFromIPFS } from "./ipfs";
+import { BatchBuilder, BatchCall, BatchOperationError, BatchSendOptions } from "./batch/BatchBuilder";
 
 export const CONTRACT_INTERFACE_VERSION = 1;
+
+type FeePriority = "low" | "medium" | "high";
+
+type WriteOptions = {
+  /** Fee priority strategy. Ignored when `fee` or `simulatedFee` are provided. */
+  feePriority?: FeePriority;
+  /** Explicit fee to use (stroops). Highest precedence. */
+  fee?: string;
+  /** Explicit pre-computed min resource fee to use (stroops). */
+  simulatedFee?: string;
+  /** Pre-computed footprint / transactionData. */
+  footprint?: any;
+  /** If true, return prepared unsigned transaction XDR instead of submitting. */
+  returnUnsignedXdr?: boolean;
+  /** If true, wait for transaction confirmation before returning (only on submit). */
+  waitForConfirmation?: boolean;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+};
 
 export class StellarGrantsSDK {
   public readonly pendingXdrStore = new PendingXdrStore();
@@ -27,13 +55,19 @@ export class StellarGrantsSDK {
   private readonly server: any;
   private readonly config: StellarGrantsSDKConfig;
   private eventPollHandle: ReturnType<typeof setTimeout> | null = null;
+  private eventHeartbeatHandle: ReturnType<typeof setTimeout> | null = null;
+  private eventWs: WebSocket | null = null;
 
   constructor(config: StellarGrantsSDKConfig) {
     if (!config.rpcUrl && !config.proxyUrl) {
       throw new Error("Either rpcUrl or proxyUrl must be provided.");
     }
 
-    this.config = config;
+    // `wallet` takes precedence over `signer` when both are provided
+    this.config = {
+      ...config,
+      signer: config.wallet ?? config.signer,
+    };
     this.contract = new Contract(config.contractId);
     const serverUrl = config.proxyUrl ?? config.rpcUrl!;
     this.server = new rpc.Server(serverUrl, {
@@ -44,17 +78,64 @@ export class StellarGrantsSDK {
 
   /**
    * Creates a new grant.
+   * 
+   * @param input Grant creation parameters
+   * @param options Transaction options including IPFS configuration
+   * @returns Transaction result
+   * 
+   * @example
+   * ```typescript
+   * // With IPFS metadata upload
+   * const result = await sdk.grantCreate(
+   *   {
+   *     owner: 'G...',
+   *     title: 'My Grant',
+   *     description: 'ipfs://Qm...', // Will be auto-uploaded if ipfsConfig provided
+   *     budget: BigInt(1000000),
+   *     deadline: BigInt(Date.now() / 1000 + 86400 * 30),
+   *     milestoneCount: 3
+   *   },
+   *   {
+   *     ipfsConfig: { pinataJwt: process.env.PINATA_JWT },
+   *     uploadMetadata: true
+   *   }
+   * );
+   * ```
    */
   async grantCreate(
     input: GrantCreateInput,
-    options?: { feePriority?: "low" | "medium" | "high"; simulatedFee?: string },
+    options?: { 
+      feePriority?: "low" | "medium" | "high"; 
+      fee?: string;
+      simulatedFee?: string; 
+      footprint?: any;
+      ipfsConfig?: IpfsUploadConfig;
+      uploadMetadata?: boolean;
+    },
   ): Promise<unknown> {
+    let description = input.description;
+
+    // Auto-upload metadata to IPFS if requested
+    if (options?.uploadMetadata && options?.ipfsConfig) {
+      const metadata = {
+        title: input.title,
+        description: input.description,
+        budget: input.budget.toString(),
+        deadline: input.deadline.toString(),
+        milestoneCount: input.milestoneCount,
+        owner: input.owner,
+      };
+
+      const { cid } = await uploadMetadataToIPFS(metadata, options.ipfsConfig);
+      description = `ipfs://${cid}`;
+    }
+
     return this.invokeWrite(
       "grant_create",
       [
         nativeToScVal(input.owner, { type: "address" }),
         nativeToScVal(input.title),
-        nativeToScVal(input.description),
+        nativeToScVal(description),
         nativeToScVal(input.budget, { type: "i128" }),
         nativeToScVal(input.deadline, { type: "u64" }),
         nativeToScVal(input.milestoneCount, { type: "u32" }),
@@ -66,7 +147,7 @@ export class StellarGrantsSDK {
   /**
    * Funds an existing grant.
    */
-  async grantFund(input: GrantFundInput, options?: { feePriority?: "low" | "medium" | "high"; simulatedFee?: string }): Promise<unknown> {
+  async grantFund(input: GrantFundInput, options?: { feePriority?: "low" | "medium" | "high"; simulatedFee?: string; footprint?: any }): Promise<unknown> {
     return this.invokeWrite(
       "grant_fund",
       [
@@ -83,7 +164,7 @@ export class StellarGrantsSDK {
    */
   async milestoneSubmit(
     input: MilestoneSubmitInput,
-    options?: { feePriority?: "low" | "medium" | "high"; simulatedFee?: string },
+    options?: { feePriority?: "low" | "medium" | "high"; fee?: string; simulatedFee?: string },
   ): Promise<unknown> {
     return this.invokeWrite(
       "milestone_submit",
@@ -101,7 +182,7 @@ export class StellarGrantsSDK {
    */
   async milestoneVote(
     input: MilestoneVoteInput,
-    options?: { feePriority?: "low" | "medium" | "high"; simulatedFee?: string },
+    options?: { feePriority?: "low" | "medium" | "high"; fee?: string; simulatedFee?: string },
   ): Promise<unknown> {
     return this.invokeWrite(
       "milestone_vote",
@@ -115,10 +196,178 @@ export class StellarGrantsSDK {
   }
 
   /**
-   * Reads a grant by id.
+   * Polls for transaction status until it reaches a terminal state.
+   * Resolves with TransactionResult on SUCCESS, rejects on FAILED, timeout, or network error.
    */
-  async grantGet(grantId: number): Promise<unknown> {
-    return this.invokeRead("grant_get", [nativeToScVal(grantId, { type: "u32" })]);
+  async waitForTransaction(
+    hash: string,
+    options?: WaitForTransactionOptions,
+  ): Promise<TransactionResult> {
+    const pollIntervalMs = options?.pollIntervalMs ?? 3000;
+    const timeoutMs = options?.timeoutMs ?? 60000;
+    const maxNetworkRetries = options?.maxNetworkRetries ?? 3;
+    const signal = options?.signal;
+
+    if (pollIntervalMs < 500) {
+      throw new Error(`pollIntervalMs must be at least 500ms, got ${pollIntervalMs}ms`);
+    }
+
+    if (timeoutMs <= pollIntervalMs) {
+      throw new Error(`timeoutMs (${timeoutMs}ms) must be greater than pollIntervalMs (${pollIntervalMs}ms)`);
+    }
+
+    if (signal?.aborted) {
+      return Promise.reject(new StellarGrantsError("Transaction polling cancelled", "ABORTED"));
+    }
+
+    return new Promise((resolve, reject) => {
+      let active = true;
+      const startTime = Date.now();
+      let attempt = 0;
+      let consecutiveNetworkErrors = 0;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      let abortListener: (() => void) | null = null;
+
+      const cleanup = () => {
+        active = false;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        if (abortListener && signal) {
+          signal.removeEventListener("abort", abortListener);
+        }
+      };
+
+      const poll = async () => {
+        if (!active) return;
+
+        attempt++;
+        const elapsedMs = Date.now() - startTime;
+
+        try {
+          const response = await this.server.getTransaction(hash);
+
+          if (!active) return;
+
+          consecutiveNetworkErrors = 0;
+          const status = response?.status as TransactionPollingStatus;
+
+          options?.onStatusChange?.(status);
+
+          switch (status) {
+            case "SUCCESS": {
+              cleanup();
+              resolve({
+                status: "SUCCESS",
+                ledger: response.ledger,
+                envelopeXdr: response.envelopeXdr || response.envelope_xdr,
+                resultXdr: response.resultXdr || response.result_xdr,
+                resultMetaXdr: response.resultMetaXdr || response.result_meta_xdr,
+                hash,
+              });
+              return;
+            }
+            case "FAILED": {
+              cleanup();
+              reject(new TransactionFailedError(hash, response?.errorResult, { raw: response }));
+              return;
+            }
+            case "PENDING":
+            case "DUPLICATE":
+            case "TRY_AGAIN_LATER":
+            case "NOT_FOUND":
+              break;
+            default:
+              break;
+          }
+
+          options?.onPoll?.(attempt, elapsedMs);
+
+          if (elapsedMs >= timeoutMs) {
+            cleanup();
+            reject(new TransactionTimeoutError(hash, timeoutMs));
+            return;
+          }
+
+          if (!active) return;
+          setTimeout(poll, pollIntervalMs);
+        } catch (error) {
+          if (!active) return;
+
+          consecutiveNetworkErrors++;
+
+          if (consecutiveNetworkErrors > maxNetworkRetries) {
+            cleanup();
+            reject(new StellarGrantsError(`Network error after ${maxNetworkRetries} retries: ${error}`, "NETWORK_ERROR", error));
+            return;
+          }
+
+          options?.onPoll?.(attempt, Date.now() - startTime);
+
+          if (!active) return;
+          setTimeout(poll, pollIntervalMs);
+        }
+      };
+
+      if (signal) {
+        abortListener = () => {
+          if (active) {
+            cleanup();
+            reject(new StellarGrantsError("Transaction polling cancelled", "ABORTED"));
+          }
+        };
+        signal.addEventListener("abort", abortListener);
+      }
+
+      timeoutHandle = setTimeout(() => {
+        if (active) {
+          cleanup();
+          reject(new TransactionTimeoutError(hash, timeoutMs));
+        }
+      }, timeoutMs);
+
+      poll();
+    });
+  }
+
+  /**
+   * Reads a grant by id.
+   * 
+   * @param grantId Grant identifier
+   * @param options Options including IPFS gateway fallbacks
+   * @returns Grant data with metadata fetched from IPFS if applicable
+   * 
+   * @example
+   * ```typescript
+   * const grant = await sdk.grantGet(1, {
+   *   fetchIpfsMetadata: true,
+   *   ipfsGateways: ['https://gateway.pinata.cloud/ipfs/']
+   * });
+   * ```
+   */
+  async grantGet(
+    grantId: number,
+    options?: {
+      fetchIpfsMetadata?: boolean;
+      ipfsGateways?: string[];
+    }
+  ): Promise<unknown> {
+    const grant = await this.invokeRead("grant_get", [nativeToScVal(grantId, { type: "u32" })]);
+
+    // Fetch IPFS metadata if description is an IPFS CID
+    if (options?.fetchIpfsMetadata && grant && typeof grant === 'object') {
+      const description = (grant as any).description || '';
+      if (description.startsWith('ipfs://')) {
+        const cid = description.replace('ipfs://', '');
+        try {
+          const metadata = await fetchMetadataFromIPFS(cid, options.ipfsGateways);
+          return { ...grant, metadata, description };
+        } catch (error) {
+          // Log but don't fail if IPFS fetch fails
+          console.warn(`Failed to fetch IPFS metadata for CID ${cid}:`, error);
+        }
+      }
+    }
+
+    return grant;
   }
 
   /**
@@ -159,47 +408,296 @@ export class StellarGrantsSDK {
     return this.server.getAccount(accountId);
   }
 
-  subscribeToEvents(callback: (event: any) => void): () => void {
+  subscribeToEvents(
+    callback: (event: any) => void,
+    options?: {
+      eventName?: string;
+      startCursor?: string;
+      pollIntervalMs?: number;
+      maxRetries?: number;
+      baseBackoffMs?: number;
+      maxBackoffMs?: number;
+      heartbeatTimeoutMs?: number;
+      /**
+       * Optional WebSocket URL for providers that support streaming.
+       * When omitted, the SDK uses HTTP polling only.
+       */
+      websocketUrl?: string;
+      /**
+       * Optional persistent cursor storage (e.g. localStorage).
+       * If provided, cursor is loaded on start and saved after each successful page.
+       */
+      cursorStore?: { get: () => string | null; set: (cursor: string) => void };
+      onError?: (error: any) => void;
+      onStatusChange?: (status: "connecting" | "active" | "reconnecting" | "closed") => void;
+    }
+  ): () => void {
     let active = true;
+    let cursor = options?.cursorStore?.get?.() ?? options?.startCursor;
+    let retryCount = 0;
+    const maxRetries = options?.maxRetries ?? 10;
+    const pollIntervalMs = options?.pollIntervalMs ?? 5000;
+    const baseBackoffMs = options?.baseBackoffMs ?? 1000;
+    const maxBackoffMs = options?.maxBackoffMs ?? 30000;
+    const heartbeatTimeoutMs = options?.heartbeatTimeoutMs ?? 60000;
+    const seenIds = new Set<string>();
 
-    const normalizeEvent = (raw: any) => ({
-      id: raw.id,
-      type: raw.type,
-      contractId: raw.contractId ?? raw.contract_id,
-      ledger: raw.ledger,
-      timestamp: raw.timestamp,
-      topic: raw.topic,
-      value: raw.value ?? raw._value,
-    });
-
-    const poll = async () => {
-      if (!active) return;
+    const normalizeEvent = (raw: any) => {
+      let name = "unknown";
       try {
-        const response = await this.server.getEvents();
-        if (response?.events && Array.isArray(response.events)) {
-          for (const rawEvent of response.events) {
-            callback(normalizeEvent(rawEvent));
-          }
+        if (raw.topic && Array.isArray(raw.topic) && raw.topic.length > 0) {
+          const firstTopic = raw.topic[0];
+          const scval = typeof firstTopic === "string" ? xdr.ScVal.fromXDR(firstTopic, "base64") : firstTopic;
+          name = String(scValToNative(scval));
         }
       } catch {
-        // Swallow polling errors.
+        // ignore decoding errors
       }
 
-      if (active) {
-        this.eventPollHandle = setTimeout(poll, 0);
-      }
+      return {
+        id: raw.id,
+        type: raw.type,
+        contractId: raw.contractId ?? raw.contract_id,
+        ledger: raw.ledger,
+        timestamp: raw.timestamp,
+        topic: raw.topic,
+        value: raw.value ?? raw._value,
+        name,
+        pagingToken: raw.pagingToken ?? raw.paging_token,
+      };
     };
 
-    poll();
-
-    return () => {
-      active = false;
+    const cleanup = () => {
       if (this.eventPollHandle) {
         clearTimeout(this.eventPollHandle);
         this.eventPollHandle = null;
       }
+      if (this.eventHeartbeatHandle) {
+        clearTimeout(this.eventHeartbeatHandle);
+        this.eventHeartbeatHandle = null;
+      }
+      if (this.eventWs) {
+        try {
+          this.eventWs.onclose = null;
+          this.eventWs.onerror = null;
+          this.eventWs.onmessage = null;
+          this.eventWs.close();
+        } catch {
+          // ignore
+        }
+        this.eventWs = null;
+      }
+    };
+
+    const resetHeartbeat = () => {
+      if (this.eventHeartbeatHandle) clearTimeout(this.eventHeartbeatHandle);
+      this.eventHeartbeatHandle = setTimeout(() => {
+        if (!active) return;
+        // No successful poll within window → force reconnect.
+        cleanup();
+        scheduleReconnect();
+      }, heartbeatTimeoutMs);
+    };
+
+    const tryWebSocket = (): boolean => {
+      // Only attempt WS in environments that support it.
+      if (typeof WebSocket === "undefined") return false;
+
+      // Only use WebSocket when the caller explicitly provides a ws(s) URL.
+      // Most Soroban RPC providers expose HTTP JSON-RPC only.
+      const wsUrl = options?.websocketUrl?.replace(/\/+$/, "");
+      if (!wsUrl || !/^wss?:\/\//i.test(wsUrl)) return false;
+
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch {
+        return false;
+      }
+
+      this.eventWs = ws;
+
+      ws.onopen = () => {
+        options?.onStatusChange?.("connecting");
+        ws.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "subscribeEvents",
+            params: {
+              filters: [{ contractIds: [this.config.contractId] }],
+              pagination: { cursor },
+            },
+          }),
+        );
+        resetHeartbeat();
+      };
+
+      ws.onmessage = (msg) => {
+        if (!active) return;
+        try {
+          const data = JSON.parse((msg as any).data as string) as any;
+          const rawEvents = data?.result?.events ?? [];
+          if (!Array.isArray(rawEvents) || rawEvents.length === 0) return;
+          retryCount = 0;
+          options?.onStatusChange?.("active");
+          resetHeartbeat();
+
+          const processed: any[] = [];
+          let latestCursor = cursor;
+          for (const rawEvent of rawEvents) {
+            const normalized = normalizeEvent(rawEvent);
+            if (options?.eventName && normalized.name !== options.eventName) continue;
+            const token = rawEvent.pagingToken ?? rawEvent.paging_token ?? normalized.pagingToken;
+            if (token && (!latestCursor || token > latestCursor)) latestCursor = token;
+            processed.push(normalized);
+          }
+          cursor = latestCursor;
+          if (cursor) options?.cursorStore?.set?.(cursor);
+          processed.forEach(callback);
+        } catch {
+          // ignore malformed frames
+        }
+      };
+
+      ws.onerror = () => {
+        try { ws.close(); } catch {}
+      };
+
+      ws.onclose = () => {
+        this.eventWs = null;
+        if (!active) return;
+        scheduleReconnect();
+      };
+
+      return true;
+    };
+
+    const scheduleReconnect = () => {
+      if (!active) return;
+      retryCount++;
+      options?.onStatusChange?.("reconnecting");
+      if (retryCount > maxRetries) {
+        active = false;
+        options?.onStatusChange?.("closed");
+        return;
+      }
+      const delay = Math.random() * Math.min(maxBackoffMs, baseBackoffMs * 2 ** (retryCount - 1));
+      this.eventPollHandle = setTimeout(start, delay);
+    };
+
+    const start = () => {
+      if (!active) return;
+      cleanup();
+      options?.onStatusChange?.("connecting");
+      // Prefer WS if supported by provider; otherwise fall back to polling.
+      if (!tryWebSocket()) {
+        poll();
+      }
+    };
+
+    const poll = async () => {
+      if (!active) return;
+
+      try {
+        // Build getEvents filters and pagination
+        const request: any = {
+          filters: [
+            {
+              type: "contract",
+              contractIds: [this.config.contractId],
+            },
+          ],
+          pagination: {
+            limit: 100,
+          },
+        };
+
+        if (cursor) {
+          request.pagination.cursor = cursor;
+        }
+
+        if (options?.eventName) {
+          try {
+            const nameScVal = nativeToScVal(options.eventName, { type: "symbol" });
+            const nameXdr = nameScVal.toXDR("base64");
+            request.filters[0].topics = [[nameXdr]];
+          } catch {
+            // fallback if encoding fails
+          }
+        }
+
+        options?.onStatusChange?.("connecting");
+        const response = await this.server.getEvents(request);
+
+        if (!active) return;
+
+        retryCount = 0;
+        options?.onStatusChange?.("active");
+        resetHeartbeat();
+
+        if (response?.events && Array.isArray(response.events)) {
+          let latestCursor = cursor;
+          const processedEvents: any[] = [];
+
+          for (const rawEvent of response.events) {
+            // Deduplicate
+            if (rawEvent.id) {
+              if (seenIds.has(rawEvent.id)) {
+                continue;
+              }
+              seenIds.add(rawEvent.id);
+            }
+
+            const normalized = normalizeEvent(rawEvent);
+
+            // Client-side event name filter backup
+            if (options?.eventName && normalized.name !== options.eventName) {
+              continue;
+            }
+
+            const token = rawEvent.pagingToken ?? rawEvent.paging_token;
+            if (token && (!latestCursor || token > latestCursor)) {
+              latestCursor = token;
+            }
+
+            processedEvents.push(normalized);
+          }
+
+          cursor = latestCursor;
+          if (cursor) options?.cursorStore?.set?.(cursor);
+
+          // Prune seenIds to prevent memory leak
+          if (seenIds.size > 5000) {
+            const arr = Array.from(seenIds);
+            seenIds.clear();
+            arr.slice(arr.length - 1000).forEach((id) => seenIds.add(id));
+          }
+
+          for (const ev of processedEvents) {
+            callback(ev);
+          }
+        }
+
+        if (active) {
+          this.eventPollHandle = setTimeout(poll, pollIntervalMs);
+        }
+      } catch (err: any) {
+        if (!active) return;
+        if (options?.onError) options.onError(err);
+        scheduleReconnect();
+      }
+    };
+
+    start();
+
+    return () => {
+      active = false;
+      options?.onStatusChange?.("closed");
+      cleanup();
     };
   }
+
 
   async estimateFees(method: string, args: xdr.ScVal[], options?: { horizonUrl?: string; feePriority?: "low" | "medium" | "high"; simulatedFee?: string }): Promise<any> {
     const simulation = await this.server.simulateTransaction(await this.buildTx(method, args, options));
@@ -239,11 +737,15 @@ export class StellarGrantsSDK {
       }
     }
 
+    // Static tiers derived from simulation
+    const ceilDiv = (a: bigint, b: bigint) => (a + b - BigInt(1)) / b;
+    const mulCeil = (v: bigint, num: bigint, den: bigint) => ceilDiv(v * num, den);
+
     return {
       base: base.toString(),
       source: "simulation-fallback",
       low: base.toString(),
-      medium: ((base * BigInt(15) + BigInt(9)) / BigInt(10)).toString(),
+      medium: mulCeil(base, BigInt(15), BigInt(10)).toString(),
       high: (base * BigInt(2)).toString(),
       modifiers: { low: 1, medium: 1.5, high: 2 },
     };
@@ -287,6 +789,36 @@ export class StellarGrantsSDK {
     }
   }
 
+  /**
+   * Upload metadata to IPFS using configured provider.
+   * Helper method that wraps the standalone uploadMetadataToIPFS function.
+   * 
+   * @param metadata JSON metadata object
+   * @param config IPFS upload configuration
+   * @returns CID and gateway URL
+   */
+  async uploadMetadataToIPFS(
+    metadata: Record<string, unknown>,
+    config: IpfsUploadConfig
+  ) {
+    return uploadMetadataToIPFS(metadata, config);
+  }
+
+  /**
+   * Fetch metadata from IPFS with fallback gateways.
+   * Helper method that wraps the standalone fetchMetadataFromIPFS function.
+   * 
+   * @param cid IPFS Content Identifier
+   * @param gateways Optional custom gateway list
+   * @returns Parsed metadata object
+   */
+  async fetchMetadataFromIPFS(
+    cid: string,
+    gateways?: string[]
+  ) {
+    return fetchMetadataFromIPFS(cid, gateways);
+  }
+
   private async setAllowance(token: string, amount: bigint, owner: string) {
     await this.invokeWrite("set_allowance", [
       nativeToScVal(token, { type: "address" }),
@@ -306,13 +838,41 @@ export class StellarGrantsSDK {
     }
   }
 
-  private async invokeWrite(method: string, args: xdr.ScVal[], options?: { feePriority?: "low" | "medium" | "high"; simulatedFee?: string }): Promise<unknown> {
+  private async invokeWrite(
+    method: string,
+    args: xdr.ScVal[],
+    options?: WriteOptions,
+  ): Promise<unknown> {
     try {
       const tx = await this.buildTx(method, args, options);
       const simulation = await this.server.simulateTransaction(tx);
       this.ensureSimulationSuccess(simulation);
 
-      const prepared = await this.server.prepareTransaction(tx);
+      const minResourceFee = BigInt(simulation?.minResourceFee ?? "0");
+
+      // Fee selection precedence: explicit fee > simulatedFee > priority(minResourceFee) > defaultFee
+      const desiredFee =
+        options?.fee ??
+        options?.simulatedFee ??
+        (simulation?.minResourceFee
+          ? this.applyFeePriority(minResourceFee, options?.feePriority).toString()
+          : undefined);
+
+      const txForSending = desiredFee
+        ? await this.buildTx(method, args, { ...options, simulatedFee: desiredFee })
+        : tx;
+
+      const prepared = await this.server.prepareTransaction(txForSending);
+
+      if (options?.returnUnsignedXdr) {
+        const id =
+          (globalThis as any).crypto?.randomUUID?.() ??
+          `pending_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        const xdr = prepared.toXDR();
+        this.pendingXdrStore.save(id, xdr);
+        return { id, xdr };
+      }
+
       if (!this.config.signer) {
         throw new Error("A signer is required for write operations.");
       }
@@ -327,13 +887,68 @@ export class StellarGrantsSDK {
       if (sent.status === "ERROR") {
         throw new StellarGrantsError(`Send failed: ${sent.errorResult ?? "unknown error"}`);
       }
+
+      if (options?.waitForConfirmation && sent.hash) {
+        return this.waitForTransaction(sent.hash, {
+          pollIntervalMs: options.pollIntervalMs,
+          timeoutMs: options.timeoutMs,
+        });
+      }
+
       return sent;
     } catch (error) {
       throw parseSorobanError(error);
     }
   }
 
-  private async buildTx(method: string, args: xdr.ScVal[], options?: { feePriority?: "low" | "medium" | "high"; simulatedFee?: string }): Promise<any> {
+  /**
+   * Simulate a transaction and return the ledger entry footprint for caching.
+   *
+   * Advanced callers can pass the returned footprint back via `options.footprint`
+   * on subsequent write calls to skip redundant simulation round-trips for
+   * repeated read-only access patterns. See [issue #462](https://github.com/StellarGrant/StellarGrant-fe/issues/462).
+   *
+   * @example
+   * ```ts
+   * const footprint = await sdk.simulateFootprint("grant_read", [grantIdVal]);
+   * // Reuse across multiple calls without simulating each time:
+   * await sdk.grantCreate(input, { footprint });
+   * ```
+   */
+  async simulateFootprint(method: string, args: xdr.ScVal[]): Promise<any> {
+    try {
+      const tx = await this.buildTx(method, args);
+      const simulation = await this.server.simulateTransaction(tx);
+      this.ensureSimulationSuccess(simulation);
+      return simulation?.transactionData ?? simulation?.footprint ?? null;
+    } catch (error) {
+      throw parseSorobanError(error);
+    }
+  }
+
+  private applyFeePriority(
+    base: bigint,
+    priority?: "low" | "medium" | "high",
+  ): bigint {
+    switch (priority) {
+      // Keep these conservative defaults aligned with `estimateFees()` fallback tiers.
+      case "low":    return base;
+      case "high":   return base * BigInt(2);
+      case "medium":
+      default:       return (base * BigInt(15) + BigInt(9)) / BigInt(10);
+    }
+  }
+
+  private async buildTx(
+    method: string,
+    args: xdr.ScVal[],
+    options?: {
+      feePriority?: "low" | "medium" | "high";
+      fee?: string;
+      simulatedFee?: string;
+      footprint?: any;
+    },
+  ): Promise<any> {
     const signer = this.config.signer;
     if (!signer) {
       throw new Error("A signer is required to build a transaction.");
@@ -341,15 +956,155 @@ export class StellarGrantsSDK {
 
     const source = await signer.getPublicKey();
     const account = await this.server.getAccount(source);
-    const fee = options?.simulatedFee ?? this.config.defaultFee ?? "100";
+    const fee = options?.fee ?? options?.simulatedFee ?? this.config.defaultFee ?? "100";
 
-    return new TransactionBuilder(account, {
+    let builder = new TransactionBuilder(account, {
       fee,
       networkPassphrase: this.config.networkPassphrase,
     })
       .addOperation(this.contract.call(method, ...args))
-      .setTimeout(60)
-      .build();
+      .setTimeout(60);
+
+    // #462 — attach pre-computed footprint when provided
+    if (options?.footprint) {
+      builder = (builder as any).setSorobanData(options.footprint) ?? builder;
+    }
+
+    return builder.build();
+  }
+
+  /**
+   * Batch multiple contract calls into a single Stellar transaction.
+   */
+  batch(): BatchBuilder {
+    return new BatchBuilder(this);
+  }
+
+  /**
+   * Multi-sig helper: merge signatures from multiple signed XDRs.
+   */
+  combineSignatures(baseXdr: string, signaturesXdrs: string[]): string {
+    return combineSignatures(baseXdr, signaturesXdrs, this.config.networkPassphrase);
+  }
+
+  // -------------------------------------------------------------------------
+  // Batch internals (intentionally not part of the public API surface)
+  // -------------------------------------------------------------------------
+
+  async __simulateBatch(calls: BatchCall[], options?: Omit<BatchSendOptions, "waitForConfirmation" | "returnUnsignedXdr">): Promise<any> {
+    try {
+      const tx = await this.__buildBatchTx(calls, options);
+      const simulation = await this.server.simulateTransaction(tx);
+      this.ensureSimulationSuccess(simulation);
+
+      // Best-effort: if the RPC returns per-op results, surface the failing index.
+      const results = (simulation as any)?.results;
+      if (Array.isArray(results)) {
+        const idx = results.findIndex((r: any) => r?.error);
+        if (idx >= 0) {
+          throw new BatchOperationError(
+            `Batch simulation failed at operation #${idx}`,
+            {
+              operationIndex: idx,
+              method: calls[idx]?.method,
+              label: calls[idx]?.label,
+              details: results[idx],
+            },
+          );
+        }
+      }
+
+      return simulation;
+    } catch (error) {
+      throw parseSorobanError(error);
+    }
+  }
+
+  async __sendBatch(calls: BatchCall[], options?: BatchSendOptions): Promise<any> {
+    try {
+      const tx = await this.__buildBatchTx(calls, options);
+      const simulation = await this.server.simulateTransaction(tx);
+      this.ensureSimulationSuccess(simulation);
+
+      const minResourceFee = BigInt(simulation?.minResourceFee ?? "0");
+      const desiredFee =
+        options?.fee ??
+        options?.simulatedFee ??
+        (simulation?.minResourceFee
+          ? this.applyFeePriority(minResourceFee, options?.feePriority).toString()
+          : undefined);
+
+      const txForSending = desiredFee
+        ? await this.__buildBatchTx(calls, { ...options, simulatedFee: desiredFee })
+        : tx;
+
+      const prepared = await this.server.prepareTransaction(txForSending);
+
+      if (options?.returnUnsignedXdr) {
+        const id =
+          (globalThis as any).crypto?.randomUUID?.() ??
+          `pending_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        const xdr = prepared.toXDR();
+        this.pendingXdrStore.save(id, xdr);
+        return { id, xdr };
+      }
+
+      if (!this.config.signer) {
+        throw new Error("A signer is required for write operations.");
+      }
+
+      const signedXdr = await this.config.signer.signTransaction(
+        prepared.toXDR(),
+        this.config.networkPassphrase,
+      );
+      const signedTx = TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase);
+      const sent = await this.server.sendTransaction(signedTx);
+      if (sent.status === "ERROR") {
+        throw new StellarGrantsError(`Send failed: ${sent.errorResult ?? "unknown error"}`);
+      }
+
+      if (options?.waitForConfirmation && sent.hash) {
+        return this.waitForTransaction(sent.hash, {
+          pollIntervalMs: options.pollIntervalMs,
+          timeoutMs: options.timeoutMs,
+        });
+      }
+
+      return sent;
+    } catch (error) {
+      throw parseSorobanError(error);
+    }
+  }
+
+  private async __buildBatchTx(
+    calls: BatchCall[],
+    options?: { feePriority?: FeePriority; fee?: string; simulatedFee?: string; footprint?: any },
+  ): Promise<any> {
+    const signer = this.config.signer;
+    if (!signer) {
+      throw new Error("A signer is required to build a transaction.");
+    }
+
+    const source = await signer.getPublicKey();
+    const account = await this.server.getAccount(source);
+    const fee = options?.fee ?? options?.simulatedFee ?? this.config.defaultFee ?? "100";
+
+    let builder = new TransactionBuilder(account, {
+      fee,
+      networkPassphrase: this.config.networkPassphrase,
+    });
+
+    for (const c of calls) {
+      builder = builder.addOperation(this.contract.call(c.method, ...c.args));
+    }
+
+    builder = builder.setTimeout(60);
+
+    if (options?.footprint) {
+      builder = (builder as any).setSorobanData(options.footprint) ?? builder;
+    }
+
+    return builder.build();
   }
 
   private ensureSimulationSuccess(simulation: any) {

@@ -16,9 +16,11 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useWalletStore } from "@/lib/store/walletStore";
 import { useMilestone } from "./useMilestone";
 import { contractClient } from "@/lib/stellar/contract";
+import { useContractTransaction } from "./useContractTransaction";
 import type { ToastEventDetail } from "@/components/ui/NotificationToast";
 import type { MilestoneVote } from "@/types";
 
@@ -115,6 +117,8 @@ export function useVoting({
   milestoneIdx,
 }: UseVotingOptions): UseVotingReturn {
   const { address: walletAddress, network } = useWalletStore();
+  const queryClient = useQueryClient();
+  const { execute } = useContractTransaction();
 
   // Underlying milestone data (votes list) from the server/contract
   const { votes: liveVotes } = useMilestone(grantId, milestoneIdx);
@@ -171,7 +175,24 @@ export function useVoting({
 
       // ── Contract call ────────────────────────────────────────────────
       try {
-        await contractClient.voteOnMilestone(grantId, milestoneIdx, approve);
+        const xdrString = await contractClient.voteOnMilestone(
+          grantId,
+          milestoneIdx,
+          approve,
+          walletAddress
+        );
+
+        const txHash = await execute({
+          xdr: xdrString,
+        });
+
+        if (!txHash) {
+          throw new Error("Transaction rejected or failed");
+        }
+
+        // Invalidate cached milestone and grant data so vote tallies refresh
+        await queryClient.invalidateQueries({ queryKey: ["milestone", grantId, milestoneIdx] });
+        await queryClient.invalidateQueries({ queryKey: ["grant", grantId] });
 
         emitToast({
           type: "vote_recorded",

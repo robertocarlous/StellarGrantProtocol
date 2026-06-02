@@ -4,8 +4,26 @@ export type StellarGrantsSigner = {
 };
 
 export type WalletAdapter = StellarGrantsSigner & {
+  /** Human-readable wallet name, e.g. "Freighter", "Albedo". */
+  readonly name: string;
+
+  /** URL to a wallet icon (SVG or PNG). Used by UI components. */
+  readonly icon?: string;
+
+  /**
+   * Returns true if this wallet is available in the current environment.
+   * Browser extension adapters check window globals; WalletConnect always returns true.
+   * Called synchronously — no async detection needed.
+   */
+  isAvailable(): boolean;
+
+  /** Optional: initiate a pairing flow (WalletConnect). */
   connect?(networkPassphrase: string): Promise<{ uri: string; approval: () => Promise<void> }>;
+
+  /** Optional: tear down the session. */
   disconnect?(): Promise<void>;
+
+  /** True when a session is active (WalletConnect). */
   isConnected?: boolean;
 };
 
@@ -28,6 +46,17 @@ export type StellarGrantsSDKConfig = {
   customHeaders?: Record<string, string>;
   networkPassphrase: string;
   signer?: StellarGrantsSigner;
+  /**
+   * Alias for `signer`. Accepts any WalletAdapter instance directly.
+   * If both `wallet` and `signer` are provided, `wallet` takes precedence.
+   *
+   * @example
+   * ```ts
+   * import { FreighterAdapter } from "@stellargrants/client-sdk";
+   * const sdk = new StellarGrantsSDK({ wallet: new FreighterAdapter(), ... });
+   * ```
+   */
+  wallet?: WalletAdapter;
   defaultFee?: string;
 };
 
@@ -38,6 +67,18 @@ export type GrantCreateInput = {
   budget: bigint;
   deadline: bigint;
   milestoneCount: number;
+};
+
+/**
+ * Minimal shape used by Vue composables.
+ * The contract return type is currently `unknown` at the SDK boundary, so
+ * downstream apps can narrow this to their own domain model.
+ */
+export type GrantData = Record<string, unknown> & {
+  id?: number;
+  title?: string;
+  description?: string;
+  status?: string;
 };
 
 export type GrantFundInput = {
@@ -72,4 +113,30 @@ export type MilestoneVoteInput = {
   grantId: number;
   milestoneIdx: number;
   approve: boolean;
+};
+
+export type TransactionPollingStatus =
+  | "SUCCESS"
+  | "FAILED"
+  | "PENDING"
+  | "DUPLICATE"
+  | "TRY_AGAIN_LATER"
+  | "NOT_FOUND";
+
+export type TransactionResult = {
+  status: "SUCCESS";
+  ledger: number;
+  envelopeXdr: string;
+  resultXdr: string;
+  resultMetaXdr: string;
+  hash: string;
+};
+
+export type WaitForTransactionOptions = {
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+  maxNetworkRetries?: number;
+  onStatusChange?: (status: TransactionPollingStatus) => void;
+  onPoll?: (attempt: number, elapsedMs: number) => void;
+  signal?: AbortSignal;
 };
