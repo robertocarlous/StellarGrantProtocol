@@ -9,7 +9,7 @@
 [![Next.js](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
 [![Stellar SDK](https://img.shields.io/badge/Stellar%20SDK-13.x-7D00FF)](https://stellar.github.io/js-stellar-sdk/)
 [![Contributors](https://img.shields.io/github/contributors/StellarGrant/stellargrant-fe)](https://github.com/StellarGrant/stellargrant-fe/graphs/contributors)
-[![Wave Program](https://img.shields.io/badge/Stellar-Wave%20Program-blue)](https://drips.network/wave/stellar)
+
 
 [Overview](#overview) • [Features](#features) • [Architecture](#architecture) • [Quick Start](#quick-start) • [Packages](#packages) • [Contributing](#contributing) • [Security](#security)
 
