@@ -67,11 +67,15 @@ impl StellarGrantsContract {
         owner.require_auth();
 
         if total_amount <= 0 || milestone_amount <= 0 {
-            return Err(ContractError::InvalidInput);
+            return Err(ContractError::ZeroAmount);
         }
 
         if num_milestones == 0 || num_milestones > constants::MAX_MILESTONES_PER_GRANT {
             return Err(ContractError::InvalidInput);
+        }
+
+        if reviewers.len() > constants::MAX_REVIEWERS_PER_GRANT {
+            return Err(ContractError::ReviewerLimitExceeded);
         }
 
         let total_required = milestone_amount
@@ -649,7 +653,7 @@ impl StellarGrantsContract {
         funder.require_auth();
         reentrancy::with_non_reentrant(&env, || {
             if amount <= 0 {
-                return Err(ContractError::InvalidInput);
+                return Err(ContractError::ZeroAmount);
             }
 
             let mut grant =
@@ -710,7 +714,7 @@ impl StellarGrantsContract {
         let grant = Storage::get_grant_v(&env, grant_id);
 
         if milestone_idx >= grant.total_milestones {
-            env.panic_with_error(ContractError::InvalidInput);
+            env.panic_with_error(ContractError::MilestoneIndexOutOfBounds);
         }
 
         let milestone = Storage::get_milestone_v(&env, grant_id, milestone_idx);
@@ -941,7 +945,7 @@ impl StellarGrantsContract {
         for item in grants.iter() {
             let (grant_id, amount) = item;
             if amount <= 0 {
-                return Err(ContractError::InvalidInput);
+                return Err(ContractError::ZeroAmount);
             }
 
             let mut grant =
@@ -999,7 +1003,7 @@ fn apply_milestone_submission(
     proof_url: String,
 ) -> Result<(), ContractError> {
     if milestone_idx >= grant.total_milestones {
-        return Err(ContractError::InvalidInput);
+        return Err(ContractError::MilestoneIndexOutOfBounds);
     }
 
     if let Some(existing) = Storage::get_milestone(env, grant_id, milestone_idx) {

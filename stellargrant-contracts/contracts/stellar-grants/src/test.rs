@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use crate::constants;
+    use crate::errors::ContractError;
     use crate::storage::Storage;
-    use crate::types::{ContractError, Grant, GrantFund, GrantStatus, Milestone, MilestoneState};
+    use crate::types::{Grant, GrantFund, GrantStatus, Milestone, MilestoneState};
     use crate::StellarGrantsContract;
     use crate::StellarGrantsContractClient;
     use soroban_sdk::{testutils::Address as _, token, Address, Env, Map, String, Vec};
